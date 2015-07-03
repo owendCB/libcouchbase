@@ -69,6 +69,7 @@ public:
     Configuration() :
         o_multiSize("batch-size"),
         o_numItems("num-items"),
+        o_numTokens("num-tokens"),
         o_keyPrefix("key-prefix"),
         o_numThreads("num-threads"),
         o_randSeed("random-seed"),
@@ -84,6 +85,7 @@ public:
     {
         o_multiSize.setDefault(100).abbrev('B').description("Number of operations to batch");
         o_numItems.setDefault(1000).abbrev('I').description("Number of items to operate on");
+        o_numTokens.setDefault(0).abbrev('O').description("Number of ops in flight at once");
         o_keyPrefix.abbrev('p').description("key prefix to use");
         o_numThreads.setDefault(1).abbrev('t').description("The number of threads to use");
         o_randSeed.setDefault(0).abbrev('s').description("Specify random seed").hide();
@@ -121,6 +123,7 @@ public:
     void addOptions(Parser& parser) {
         parser.addOption(o_multiSize);
         parser.addOption(o_numItems);
+        parser.addOption(o_numTokens);
         parser.addOption(o_keyPrefix);
         parser.addOption(o_numThreads);
         parser.addOption(o_randSeed);
@@ -198,6 +201,7 @@ public:
     bool sequentialAccess() { return o_sequential; }
     unsigned firstKeyOffset() { return o_startAt; }
     uint32_t getNumItems() { return o_numItems; }
+    uint32_t getNumTokens() { return o_numTokens; }
     uint32_t getRateLimit() { return o_rateLimit; }
 
     void *data;
@@ -216,6 +220,7 @@ public:
 private:
     UIntOption o_multiSize;
     UIntOption o_numItems;
+    UIntOption o_numTokens;
     StringOption o_keyPrefix;
     UIntOption o_numThreads;
     UIntOption o_randSeed;
@@ -410,7 +415,7 @@ private:
 class ThreadContext
 {
 public:
-    ThreadContext(lcb_t handle, int ix) : kgen(ix), niter(0), instance(handle) {
+    ThreadContext(lcb_t handle, int ix) : kgen(ix), niter(0), instance(handle), tokens(0), opCount(0) {
 
     }
 
@@ -450,25 +455,89 @@ public:
             lcb_sched_fail(instance);
         }
     }
+    
+    bool scheduleNextOperation() {
+        NextOp opinfo;
+        kgen.setNextOp(opinfo);
+        if (opinfo.isStore)
+        {
+            lcb_CMDSTORE scmd = { 0 };
+            scmd.operation = LCB_SET;
+            LCB_CMD_SET_KEY(&scmd, opinfo.key.c_str(), opinfo.key.size());
+            LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
+            error = lcb_store3(instance, this, &scmd);
+        }
+        else
+        {
+            lcb_CMDGET gcmd = { 0 };
+            LCB_CMD_SET_KEY(&gcmd, opinfo.key.c_str(), opinfo.key.size());
+            error = lcb_get3(instance, this, &gcmd);
+        }
+        if (error != LCB_SUCCESS) {
+            log("Failed to schedule operation: [0x%x] %s", error, lcb_strerror(instance, error));
+            return false;
+        } else {
+            return true;
+        }
+    }
+
+    
+    void spoolOperations() {
+        static lcb_U64 sleep_nsec = 0;
+        lcb_sched_enter(instance);
+        while (tokens > 0) {
+            if (scheduleNextOperation()) {
+                tokens--;
+                usleep(sleep_nsec / 1000);
+            }
+        }
+        lcb_sched_leave(instance);
+
+        if (config.getRateLimit() > 0) {
+            lcb_U64 now = lcb_nstime();
+            static lcb_U64 previous_time = now;
+            static lcb_U64 last_sleep_ns = 0;
+            lcb_U64 elapsed_ns = 0;
+            if ((uint32_t)opCount > config.getNumTokens() && (now != previous_time)) {
+                elapsed_ns = (now - previous_time) / opCount;
+                const lcb_U64 wanted_duration_ns = 1e9 / config.getRateLimit();
+                if (elapsed_ns < wanted_duration_ns) {
+                    sleep_nsec = last_sleep_ns + (wanted_duration_ns - elapsed_ns)/2;
+                } else {
+                    sleep_nsec = wanted_duration_ns;
+                }
+                last_sleep_ns = sleep_nsec;
+                opCount = 0;
+                previous_time = now;
+            }
+        }
+    }
 
     bool run() {
-        do {
-            singleLoop();
+        if (config.getNumTokens() > 0) {
+            tokens = config.getNumTokens();
+            spoolOperations();
+            lcb_wait(instance);
+        } else
+        {
+            do {
+                singleLoop();
+
+                if (config.isTimings()) {
+                    InstanceCookie::dumpTimings(instance, kgen.getStageString());
+                }
+                if (config.params.shouldDump()) {
+                    lcb_dump(instance, stderr, LCB_DUMP_ALL);
+                }
+                if (config.getRateLimit() > 0) {
+                    rateLimitThrottle();
+                }
+
+            } while (!config.isLoopDone(++niter));
 
             if (config.isTimings()) {
-                InstanceCookie::dumpTimings(instance, kgen.getStageString());
+                InstanceCookie::dumpTimings(instance, kgen.getStageString(), true);
             }
-            if (config.params.shouldDump()) {
-                lcb_dump(instance, stderr, LCB_DUMP_ALL);
-            }
-            if (config.getRateLimit() > 0) {
-                rateLimitThrottle();
-            }
-
-        } while (!config.isLoopDone(++niter));
-
-        if (config.isTimings()) {
-            InstanceCookie::dumpTimings(instance, kgen.getStageString(), true);
         }
         return true;
     }
@@ -511,6 +580,8 @@ private:
     size_t niter;
     lcb_error_t error;
     lcb_t instance;
+    int tokens;
+    int opCount;
 };
 
 static void operationCallback(lcb_t, int, const lcb_RESPBASE *resp)
@@ -519,7 +590,8 @@ static void operationCallback(lcb_t, int, const lcb_RESPBASE *resp)
 
     tc = const_cast<ThreadContext *>(reinterpret_cast<const ThreadContext *>(resp->cookie));
     tc->setError(resp->rc);
-
+    tc->tokens++;
+    tc->opCount++;
 #ifndef WIN32
     static volatile unsigned long nops = 1;
     static time_t start_time = time(NULL);
@@ -535,6 +607,9 @@ static void operationCallback(lcb_t, int, const lcb_RESPBASE *resp)
         }
     }
 #endif
+    if (tc->tokens > 0) {
+        tc->spoolOperations();
+    }
 }
 
 
