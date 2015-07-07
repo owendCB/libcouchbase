@@ -36,12 +36,74 @@
 #include <cstdarg>
 #include "common/options.h"
 #include "common/histogram.h"
+#include <libcouchbase/views.h>
+
+static const char alpha[] =
+"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+"abcdefghijklmnopqrstuvwxyz";
+
+static const char num[] =
+"123456789";
+
+int alphaLength = sizeof(alpha) - 1;
+int numLength = sizeof(num) - 1;
+
 
 using namespace std;
 using namespace cbc;
 using namespace cliopts;
 using std::vector;
 using std::string;
+
+
+
+char getRandomChar() {
+    return alpha[rand()% alphaLength];
+}
+
+string getRandomString(const int stringLength) {
+    string str;
+    for (int ii = 0; ii < stringLength; ++ii) {
+        str += getRandomChar();
+    }
+    return str;
+}
+
+char getRandomNum() {
+    return num[rand() % numLength];
+}
+
+string getRandomNumber(const int numberLength) {
+    string str;
+    for (int ii = 0; ii < numberLength; ++ii) {
+        str += getRandomNum();
+    }
+    return str;
+    
+}
+
+string create_view_data(uint32_t minsz, uint32_t maxsz) {
+    if (minsz > maxsz) {
+        minsz = maxsz;
+    }
+    /**
+     * {"name" : "10RANDOMCHAR",
+     *  "age" : 2RANDOMNUM,
+     *  "address" : "10RANDOMCHAR",
+     *  "nationality" : "10RANDOMCHAR"
+     *  "filler" : "XRANDOMCHAR"
+     * }
+     */
+    stringstream ss;
+    ss << "{\"name\" : \"" << getRandomString(20) << "\", ";
+    ss << "\"age\" : " << getRandomNumber(2) << ", ";
+    ss << "\"address\" : \"" << getRandomString(17) << "\", ";
+    ss << "\"nationality\" : \"" << getRandomString(15) << "\", ";
+     ss << "\"filler\" : \"" << getRandomString(maxsz-128) << "\"}";
+   // std::cout << ss.str() << endl << endl;
+    return ss.str();
+}
+
 
 struct DeprecatedOptions {
     UIntOption iterations;
@@ -70,6 +132,7 @@ public:
         o_multiSize("batch-size"),
         o_numItems("num-items"),
         o_numTokens("num-tokens"),
+        o_numQueries("num-queries"),
         o_keyPrefix("key-prefix"),
         o_numThreads("num-threads"),
         o_randSeed("random-seed"),
@@ -86,6 +149,7 @@ public:
         o_multiSize.setDefault(100).abbrev('B').description("Number of operations to batch");
         o_numItems.setDefault(1000).abbrev('I').description("Number of items to operate on");
         o_numTokens.setDefault(0).abbrev('O').description("Number of ops in flight at once");
+        o_numQueries.setDefault(0).abbrev('Q').description("Number of queries per second");
         o_keyPrefix.abbrev('p').description("key prefix to use");
         o_numThreads.setDefault(1).abbrev('t').description("The number of threads to use");
         o_randSeed.setDefault(0).abbrev('s').description("Specify random seed").hide();
@@ -124,6 +188,7 @@ public:
         parser.addOption(o_multiSize);
         parser.addOption(o_numItems);
         parser.addOption(o_numTokens);
+        parser.addOption(o_numQueries);
         parser.addOption(o_keyPrefix);
         parser.addOption(o_numThreads);
         parser.addOption(o_randSeed);
@@ -144,6 +209,7 @@ public:
         delete []static_cast<char *>(data);
     }
 
+    
     void setPayloadSizes(uint32_t minsz, uint32_t maxsz) {
         if (minsz > maxsz) {
             minsz = maxsz;
@@ -203,6 +269,9 @@ public:
     uint32_t getNumItems() { return o_numItems; }
     uint32_t getNumTokens() { return o_numTokens; }
     uint32_t getRateLimit() { return o_rateLimit; }
+    uint32_t getMinSize() { return o_minSize.result();}
+    uint32_t getMaxSize() { return o_maxSize.result();}
+    uint32_t getNumQueries() {return o_numQueries;}
 
     void *data;
 
@@ -221,6 +290,7 @@ private:
     UIntOption o_multiSize;
     UIntOption o_numItems;
     UIntOption o_numTokens;
+    UIntOption o_numQueries;
     StringOption o_keyPrefix;
     UIntOption o_numThreads;
     UIntOption o_randSeed;
@@ -255,6 +325,7 @@ void log(const char *format, ...)
 
 extern "C" {
 static void operationCallback(lcb_t, int, const lcb_RESPBASE*);
+static void viewCallback(lcb_t instance, int ign, const lcb_RESPVIEWQUERY *rv);
 }
 
 class InstanceCookie {
@@ -430,7 +501,11 @@ public:
                 lcb_CMDSTORE scmd = { 0 };
                 scmd.operation = LCB_SET;
                 LCB_CMD_SET_KEY(&scmd, opinfo.key.c_str(), opinfo.key.size());
-                LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
+                if (config.getNumQueries() > 0) {
+                    LCB_CMD_SET_VALUE(&scmd, create_view_data(config.getMinSize(), config.getMaxSize()).c_str(), 1024);
+                } else {
+                    LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
+                }
                 error = lcb_store3(instance, this, &scmd);
 
             } else {
@@ -464,7 +539,11 @@ public:
             lcb_CMDSTORE scmd = { 0 };
             scmd.operation = LCB_SET;
             LCB_CMD_SET_KEY(&scmd, opinfo.key.c_str(), opinfo.key.size());
-            LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
+            if (config.getNumQueries() > 0) {
+                LCB_CMD_SET_VALUE(&scmd, create_view_data(config.getMinSize(), config.getMaxSize()).c_str(), 1024);
+            } else {
+                LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
+            }
             error = lcb_store3(instance, this, &scmd);
         }
         else
@@ -541,6 +620,11 @@ public:
         }
         return true;
     }
+    
+    bool run_query() {
+        return true;
+    }
+
 
 #ifndef WIN32
     pthread_t thr;
@@ -549,6 +633,7 @@ public:
 protected:
     // the callback methods needs to be able to set the error handler..
     friend void operationCallback(lcb_t, int, const lcb_RESPBASE*);
+    friend void viewCallback(lcb_t instance, int ign, const lcb_RESPVIEWQUERY *rv);
     Histogram histogram;
 
     void setError(lcb_error_t e) { error = e; }
@@ -610,6 +695,26 @@ static void operationCallback(lcb_t, int, const lcb_RESPBASE *resp)
     if (tc->tokens > 0) {
         tc->spoolOperations();
     }
+}
+
+static int cbCounter = 0;
+
+static void viewCallback(lcb_t, int, const lcb_RESPVIEWQUERY *rv)
+{
+    if (rv->rflags & LCB_RESP_F_FINAL) {
+        printf("*** META FROM VIEWS ***\n");
+        fprintf(stderr, "%.*s\n", (int)rv->nvalue, rv->value);
+        return;
+    }
+    
+   // printf("Got row callback from LCB: RC=0x%X, DOCID=%.*s. KEY=%.*s\n",
+     //      rv->rc, (int)rv->ndocid, rv->docid, (int)rv->nkey, rv->key);
+    
+    //if (rv->docresp) {
+     //   printf("   Document for response. RC=0x%X. CAS=0x%lx\n",
+      //         rv->docresp->rc, (unsigned long)rv->docresp->cas);
+    //}
+    cbCounter++;
 }
 
 
@@ -693,7 +798,6 @@ int main(int argc, char **argv)
 {
     int exit_code = EXIT_SUCCESS;
     setup_sigint_handler();
-
     Parser parser("cbc-pillowfight");
     config.addOptions(parser);
     parser.parse(argc, argv, false);
@@ -711,7 +815,9 @@ int main(int argc, char **argv)
     struct lcb_create_st options;
     ConnParams& cp = config.params;
     lcb_error_t error;
-
+    
+    
+ 
     for (uint32_t ii = 0; ii < nthreads; ++ii) {
         cp.fillCropts(options);
         lcb_t instance = NULL;
@@ -735,10 +841,57 @@ int main(int argc, char **argv)
             log("Failed to connect: %s", lcb_strerror(instance, error));
             exit(EXIT_FAILURE);
         }
-
         ThreadContext *ctx = new ThreadContext(instance, ii);
         contexts.push_back(ctx);
         start_worker(ctx);
+    }
+    
+    if (config.getNumQueries() > 0) {
+        cp.fillCropts(options);
+        lcb_t instance = NULL;
+        error = lcb_create(&instance, &options);
+        if (error != LCB_SUCCESS) {
+            log("Failed to create instance: %s", lcb_strerror(NULL, error));
+            exit(EXIT_FAILURE);
+        }
+
+        cp.doCtls(instance);
+        new InstanceCookie(instance);
+        
+        lcb_connect(instance);
+        lcb_wait(instance);
+        error = lcb_get_bootstrap_status(instance);
+        
+        if (error != LCB_SUCCESS) {
+            std::cout << std::endl;
+            log("Failed to connect: %s", lcb_strerror(instance, error));
+            exit(EXIT_FAILURE);
+        }
+        // Nao, set up the views..
+        lcb_CMDVIEWQUERY vq = { 0 };
+        std::string dName = "1";
+        std::string vName = "test";
+        std::string options2 = "reduce=false&stale=false";
+        
+        vq.callback = viewCallback;
+        vq.ddoc = dName.c_str();
+        vq.nddoc = dName.length();
+        vq.view = vName.c_str();
+        vq.nview = vName.length();
+        vq.optstr = options2.c_str();
+        vq.noptstr = options2.size();
+        
+        vq.cmdflags = LCB_CMDVIEWQUERY_F_INCLUDE_DOCS;
+        while (1) {
+            error = lcb_view_query(instance, NULL, &vq);
+            assert(rc == LCB_SUCCESS);
+            lcb_wait(instance);
+            printf("Total Invocations=%d\n", cbCounter);
+        }
+        //ThreadContext *ctx = new ThreadContext(instance, nthreads);
+        //contexts.push_back(ctx);
+        //start_worker(ctx);
+        
     }
 
     for (std::list<ThreadContext *>::iterator it = contexts.begin();
