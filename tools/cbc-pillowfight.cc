@@ -82,25 +82,32 @@ string getRandomNumber(const int numberLength) {
     
 }
 
+static const char* salesperson[] = {"bob", "john", "peter", "paul", "david", "helen", "sarah", "adam", "carl", "daniel", "mary", "rick", "paula", "mark", "chris", "ian", "patrick", "rob", "tom", "jane", "jason", "james", "claire", "jackson", "aiden", "liam", "lucas", "noah", "mason", "ethan", "archie", "caden", "jacob", "logan", "ellie", "sophia", "emma", "olivia", "ava", "isabella", "mia", "zoe", "lily", "emily", "madelyn"};
+
+static const char* geography[] = {"alabama", "alaska", "arizona", "arkansas", "california", "colorado", "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho", "illinois", "indiana", "iowa", "kansas", "kentucky", "lousisana", "maine", "maryland", "massachusetts", "michigan", "minnesota", "mississippi", "missouri", "montana", "nebraska", "nevada", "new hampshire", "new jersey", "new mexico", "new york", "north carolina", "north dakota", "ohio", "oklahoma", "oregon", "pennsylvania", "rhode island", "south carolina", "south dakota", "tennessee", "texas", "utah", "vermont", "virginia", "washington", "west virginia", "wisconsin", "wyoming"};
+
 string create_view_data(uint32_t minsz, uint32_t maxsz) {
     if (minsz > maxsz) {
         minsz = maxsz;
     }
     /**
-     * {"name" : "10RANDOMCHAR",
-     *  "age" : 2RANDOMNUM,
-     *  "address" : "10RANDOMCHAR",
-     *  "nationality" : "10RANDOMCHAR"
+     * {"salesperson" : "10RANDOMCHAR",
+     *  "sales" : 2RANDOMNUM,
+     *  "product" : "10RANDOMCHAR",
+     *  "geography" : "10RANDOMCHAR"
      *  "filler" : "XRANDOMCHAR"
      * }
      */
     stringstream ss;
-    ss << "{\"name\" : \"" << getRandomString(20) << "\", ";
-    ss << "\"age\" : " << getRandomNumber(2) << ", ";
-    ss << "\"address\" : \"" << getRandomString(17) << "\", ";
-    ss << "\"nationality\" : \"" << getRandomString(15) << "\", ";
-     ss << "\"filler\" : \"" << getRandomString(maxsz-128) << "\"}";
-   // std::cout << ss.str() << endl << endl;
+    ss << "{\"salesperson\" : \"" << salesperson[rand() % sizeof(salesperson)/sizeof(char*)] << "\", ";
+    ss << "\"cost\" : " << getRandomNumber(3) << ", ";
+    ss << "\"product\" : \"" << getRandomString(17) << "\", ";
+    ss << "\"geography\" : \"" << geography[rand() % sizeof(geography)/sizeof(char*)] << "\", ";
+    ss << "\"filler\" : \"";
+
+    size_t size = ss.str().size();
+    ss  << getRandomString(1024-(size+2)) << "\"}";
+   //std::cout << ss.str() << endl << endl;
     return ss.str();
 }
 
@@ -502,7 +509,8 @@ public:
                 scmd.operation = LCB_SET;
                 LCB_CMD_SET_KEY(&scmd, opinfo.key.c_str(), opinfo.key.size());
                 if (config.getNumQueries() > 0) {
-                    LCB_CMD_SET_VALUE(&scmd, create_view_data(config.getMinSize(), config.getMaxSize()).c_str(), 1024);
+                    std::string s = create_view_data(config.getMinSize(), config.getMaxSize());
+                    LCB_CMD_SET_VALUE(&scmd, s.c_str(), s.size());
                 } else {
                     LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
                 }
@@ -540,7 +548,8 @@ public:
             scmd.operation = LCB_SET;
             LCB_CMD_SET_KEY(&scmd, opinfo.key.c_str(), opinfo.key.size());
             if (config.getNumQueries() > 0) {
-                LCB_CMD_SET_VALUE(&scmd, create_view_data(config.getMinSize(), config.getMaxSize()).c_str(), 1024);
+                std::string s = create_view_data(config.getMinSize(), config.getMaxSize());
+                LCB_CMD_SET_VALUE(&scmd, s.c_str(), s.size());
             } else {
                 LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
             }
@@ -702,20 +711,21 @@ static int cbCounter = 0;
 static void viewCallback(lcb_t, int, const lcb_RESPVIEWQUERY *rv)
 {
     if (rv->rflags & LCB_RESP_F_FINAL) {
-        printf("*** META FROM VIEWS ***\n");
-        fprintf(stderr, "%.*s\n", (int)rv->nvalue, rv->value);
+        cbCounter++;
+
+       // printf("*** META FROM VIEWS ***\n");
+       // fprintf(stderr, "%.*s\n", (int)rv->nvalue, rv->value);
         return;
     }
+   /*
+    printf("Got row callback from LCB: RC=0x%X, DOCID=%.*s. KEY=%.*s VALUE=%.*s\n",
+           rv->rc, (int)rv->ndocid, rv->docid, (int)rv->nkey, rv->key, (int)rv->nvalue, rv->value);
     
-   // printf("Got row callback from LCB: RC=0x%X, DOCID=%.*s. KEY=%.*s\n",
-     //      rv->rc, (int)rv->ndocid, rv->docid, (int)rv->nkey, rv->key);
-    
-    //if (rv->docresp) {
-     //   printf("   Document for response. RC=0x%X. CAS=0x%lx\n",
-      //         rv->docresp->rc, (unsigned long)rv->docresp->cas);
-    //}
-    cbCounter++;
-}
+    if (rv->docresp) {
+        printf("   Document for response. RC=0x%X. CAS=0x%lx\n",
+               rv->docresp->rc, (unsigned long)rv->docresp->cas);
+    }*/
+    }
 
 
 std::list<ThreadContext *> contexts;
@@ -871,7 +881,7 @@ int main(int argc, char **argv)
         lcb_CMDVIEWQUERY vq = { 0 };
         std::string dName = "1";
         std::string vName = "test";
-        std::string options2 = "reduce=false&stale=false";
+        std::string options2 = "stale=OK&group=true";
         
         vq.callback = viewCallback;
         vq.ddoc = dName.c_str();
@@ -880,13 +890,36 @@ int main(int argc, char **argv)
         vq.nview = vName.length();
         vq.optstr = options2.c_str();
         vq.noptstr = options2.size();
-        
+
         vq.cmdflags = LCB_CMDVIEWQUERY_F_INCLUDE_DOCS;
+
+        static lcb_U64 sleep_nsec = 0;
+        const lcb_U64 wanted_duration_ns = 1e9/10;
+        static lcb_U64 last_sleep_ns = 0;
+        lcb_U64 elapsed_ns = 0;
+
         while (1) {
+            lcb_U64 now = lcb_nstime();
+             static lcb_U64 previous_time = now;
+            if (now != previous_time && cbCounter > 0) {
+                elapsed_ns = (now-previous_time) / cbCounter;
+                //printf("elapsed time = %llu count = %d \n", elapsed_ns, cbCounter);
+                if (elapsed_ns < wanted_duration_ns) {
+                    //printf("extend sleep %u %u\n", elapsed_ns, wanted_duration_ns);
+                    sleep_nsec = last_sleep_ns + (wanted_duration_ns - elapsed_ns)/2;
+                } else {
+                   // printf("REDUCE sleep %u %u\n", elapsed_ns, wanted_duration_ns);
+                    sleep_nsec = last_sleep_ns *.9;
+                }
+                last_sleep_ns = sleep_nsec;
+                previous_time = now;
+            }
+            //printf("sleep = %d\n", sleep_nsec);
+            usleep(sleep_nsec / 1000);
             error = lcb_view_query(instance, NULL, &vq);
             assert(rc == LCB_SUCCESS);
             lcb_wait(instance);
-            printf("Total Invocations=%d\n", cbCounter);
+          // printf("Total Invocations=%d\n", cbCounter);
         }
         //ThreadContext *ctx = new ThreadContext(instance, nthreads);
         //contexts.push_back(ctx);
