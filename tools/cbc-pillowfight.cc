@@ -465,8 +465,8 @@ public:
         seqno %= maxKey;
         seqno += offset-1;
 
-        char buffer[21];
-        snprintf(buffer, sizeof(buffer), "%020d", seqno);
+        char buffer[64];
+        snprintf(buffer,sizeof(buffer),"%p%020d",pthread_self(), seqno);
         op.key.assign(config.getKeyPrefix() + buffer);
     }
     const char *getStageString() const {
