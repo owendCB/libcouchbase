@@ -404,6 +404,7 @@ private:
     int id;
 
     bool isSequential;
+public:
     bool isPopulate;
 };
 
@@ -464,8 +465,10 @@ public:
             if (config.getRateLimit() > 0) {
                 rateLimitThrottle();
             }
-
-        } while (!config.isLoopDone(++niter));
+            if (!kgen.isPopulate) {
+                ++niter;
+            }
+        } while (!config.isLoopDone(niter));
 
         if (config.isTimings()) {
             InstanceCookie::dumpTimings(instance, kgen.getStageString(), true);
