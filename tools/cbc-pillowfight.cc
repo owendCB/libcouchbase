@@ -456,7 +456,7 @@ public:
         do {
             singleLoop();
 
-            if (config.isTimings()) {
+            if (config.isTimings() && 0) {
                 InstanceCookie::dumpTimings(instance, kgen.getStageString());
             }
             if (config.params.shouldDump()) {
@@ -470,7 +470,7 @@ public:
             }
         } while (!config.isLoopDone(niter));
 
-        if (config.isTimings()) {
+        if (config.isTimings() && !kgen.isPopulate) {
             InstanceCookie::dumpTimings(instance, kgen.getStageString(), true);
         }
         return true;
