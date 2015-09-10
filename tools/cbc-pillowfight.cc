@@ -69,6 +69,8 @@ public:
     Configuration() :
         o_multiSize("batch-size"),
         o_numItems("num-items"),
+        o_numPersists("num-persists"),
+        o_numReplicates("num-replicates"),
         o_keyPrefix("key-prefix"),
         o_numThreads("num-threads"),
         o_randSeed("random-seed"),
@@ -84,6 +86,8 @@ public:
     {
         o_multiSize.setDefault(100).abbrev('B').description("Number of operations to batch");
         o_numItems.setDefault(1000).abbrev('I').description("Number of items to operate on");
+        o_numPersists.setDefault(0).description("Number of persists_to for the stores");
+        o_numReplicates.setDefault(0).description("Number of replicates_to for the stores");
         o_keyPrefix.abbrev('p').description("key prefix to use");
         o_numThreads.setDefault(1).abbrev('t').description("The number of threads to use");
         o_randSeed.setDefault(0).abbrev('s').description("Specify random seed").hide();
@@ -121,6 +125,8 @@ public:
     void addOptions(Parser& parser) {
         parser.addOption(o_multiSize);
         parser.addOption(o_numItems);
+        parser.addOption(o_numPersists);
+        parser.addOption(o_numReplicates);
         parser.addOption(o_keyPrefix);
         parser.addOption(o_numThreads);
         parser.addOption(o_randSeed);
@@ -198,6 +204,8 @@ public:
     bool sequentialAccess() { return o_sequential; }
     unsigned firstKeyOffset() { return o_startAt; }
     uint32_t getNumItems() { return o_numItems; }
+    uint32_t getNumPersists() { return o_numPersists; }
+    uint32_t getNumReplicates() { return o_numReplicates; }
     uint32_t getRateLimit() { return o_rateLimit; }
 
     void *data;
@@ -216,6 +224,8 @@ public:
 private:
     UIntOption o_multiSize;
     UIntOption o_numItems;
+    UIntOption o_numPersists;
+    UIntOption o_numReplicates;
     StringOption o_keyPrefix;
     UIntOption o_numThreads;
     UIntOption o_randSeed;
@@ -250,6 +260,7 @@ void log(const char *format, ...)
 
 extern "C" {
 static void operationCallback(lcb_t, int, const lcb_RESPBASE*);
+static void durstoreCallback(lcb_t, int, const lcb_RESPBASE *rb);
 }
 
 class InstanceCookie {
@@ -423,11 +434,26 @@ public:
         for (size_t ii = 0; ii < config.opsPerCycle; ++ii) {
             kgen.setNextOp(opinfo);
             if (opinfo.isStore) {
-                lcb_CMDSTORE scmd = { 0 };
-                scmd.operation = LCB_SET;
-                LCB_CMD_SET_KEY(&scmd, opinfo.key.c_str(), opinfo.key.size());
-                LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
-                error = lcb_store3(instance, this, &scmd);
+                if (config.getNumPersists() == 0 && config.getNumReplicates() == 0) {
+                    lcb_CMDSTORE scmd = { 0 };
+                    scmd.operation = LCB_SET;
+                    LCB_CMD_SET_KEY(&scmd, opinfo.key.c_str(), opinfo.key.size());
+                    LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
+                    error = lcb_store3(instance, this, &scmd);
+                } else {
+                    /*lcb_RESPSTOREDUR resp = { 0 };
+                     lcb_RESPENDURE dur_resp = { 0 };
+                     resp.dur_resp = &dur_resp;
+                     resp.rc = LCB_ERROR;
+                     */
+                    lcb_CMDSTOREDUR scmd = { 0 };
+                    scmd.operation = LCB_SET;
+                    scmd.persist_to = config.getNumPersists();
+                    scmd.replicate_to = config.getNumReplicates();
+                    LCB_CMD_SET_KEY(&scmd, opinfo.key.c_str(), opinfo.key.size());
+                    LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
+                    error = lcb_storedur3(instance, this, &scmd);
+                }
 
             } else {
                 lcb_CMDGET gcmd = { 0 };
@@ -483,6 +509,7 @@ public:
 protected:
     // the callback methods needs to be able to set the error handler..
     friend void operationCallback(lcb_t, int, const lcb_RESPBASE*);
+    friend void durstoreCallback(lcb_t, int, const lcb_RESPBASE *rb);
     Histogram histogram;
 
     void setError(lcb_error_t e) { error = e; }
@@ -515,6 +542,19 @@ private:
     lcb_error_t error;
     lcb_t instance;
 };
+
+
+static void durstoreCallback(lcb_t, int, const lcb_RESPBASE *rb)
+{
+    //const lcb_RESPSTOREDUR *resp = reinterpret_cast<const lcb_RESPSTOREDUR*>(rb);
+    //lcb_RESPSTOREDUR *rout = reinterpret_cast<lcb_RESPSTOREDUR*>(rb->cookie);
+    //lcb_RESPENDURE *dur_resp = const_cast<lcb_RESPENDURE*>(rout->dur_resp);
+    //*rout = *resp;
+    //*dur_resp = *resp->dur_resp;
+    //rout->dur_resp = dur_resp;
+    (void)*rb;
+}
+
 
 static void operationCallback(lcb_t, int, const lcb_RESPBASE *resp)
 {
@@ -650,6 +690,7 @@ int main(int argc, char **argv)
         }
         lcb_install_callback3(instance, LCB_CALLBACK_STORE, operationCallback);
         lcb_install_callback3(instance, LCB_CALLBACK_GET, operationCallback);
+        lcb_install_callback3(instance, LCB_CALLBACK_STOREDUR, durstoreCallback);
         cp.doCtls(instance);
 
         new InstanceCookie(instance);
