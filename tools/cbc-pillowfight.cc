@@ -36,12 +36,86 @@
 #include <cstdarg>
 #include "common/options.h"
 #include "common/histogram.h"
+#include <libcouchbase/views.h>
 
 using namespace std;
 using namespace cbc;
 using namespace cliopts;
 using std::vector;
 using std::string;
+
+/************************* Code to support views *************************************/
+
+static const char alpha[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+static const char num[] = "123456789";
+
+int alphaLength = sizeof(alpha) - 1;
+int numLength = sizeof(num) - 1;
+
+char getRandomChar() {
+    return alpha[rand()% alphaLength];
+}
+
+string getRandomString(const int stringLength) {
+    string str;
+    for (int ii = 0; ii < stringLength; ++ii) {
+        str += getRandomChar();
+    }
+    return str;
+}
+
+char getRandomNum() {
+    return num[rand() % numLength];
+}
+
+string getRandomNumber(const int numberLength) {
+    string str;
+    for (int ii = 0; ii < numberLength; ++ii) {
+        str += getRandomNum();
+    }
+    return str;
+}
+
+static const char* salesperson[] = {"bob", "john", "peter", "paul", "david", "helen",
+    "sarah", "adam", "carl", "daniel", "mary", "rick", "paula", "mark", "chris", "ian",
+    "patrick", "rob", "tom", "jane", "jason", "james", "claire", "jackson", "aiden",
+    "liam", "lucas", "noah", "mason", "ethan", "archie", "caden", "jacob", "logan",
+    "ellie", "sophia", "emma", "olivia", "ava", "isabella", "mia", "zoe", "lily",
+    "emily", "madelyn"};
+
+static const char* geography[] = {"alabama", "alaska", "arizona", "arkansas",
+    "california", "colorado", "connecticut", "delaware", "florida", "georgia",
+    "hawaii", "idaho", "illinois", "indiana", "iowa", "kansas", "kentucky",
+    "lousisana", "maine", "maryland", "massachusetts", "michigan", "minnesota",
+    "mississippi", "missouri", "montana", "nebraska", "nevada", "new hampshire",
+    "new jersey", "new mexico", "new york", "north carolina", "north dakota", "ohio",
+    "oklahoma", "oregon", "pennsylvania", "rhode island", "south carolina",
+    "south dakota", "tennessee", "texas", "utah", "vermont", "virginia", "washington",
+    "west virginia", "wisconsin", "wyoming"};
+
+string create_view_data(uint32_t doc_size) {
+    /**
+     * {"salesperson" : "bob",
+     *  "sales" : 3_DIGIT_RANDOM_NUM,
+     *  "product" : "17_RANDOM_CHAR",
+     *  "geography" : "alabama"
+     *  "filler" : "X_RANDOM_CHAR"
+     * }
+     */
+    stringstream ss;
+    ss << "{\"salesperson\" : \"" << salesperson[rand() % sizeof(salesperson)/sizeof(char*)] << "\", ";
+    ss << "\"cost\" : " << getRandomNumber(3) << ", ";
+    ss << "\"product\" : \"" << getRandomString(17) << "\", ";
+    ss << "\"geography\" : \"" << geography[rand() % sizeof(geography)/sizeof(char*)] << "\", ";
+    ss << "\"filler\" : \"";
+    
+    size_t size = ss.str().size();
+    ss  << getRandomString(doc_size-(size+2)) << "\"}";
+    //std::cout << ss.str() << endl << endl;
+    return ss.str();
+}
+
+/******************************************************************************************************/
 
 struct DeprecatedOptions {
     UIntOption iterations;
@@ -71,6 +145,7 @@ public:
         o_numItems("num-items"),
         o_numPersists("num-persists"),
         o_numReplicates("num-replicates"),
+        o_numQueries("num-queries"),
         o_keyPrefix("key-prefix"),
         o_numThreads("num-threads"),
         o_randSeed("random-seed"),
@@ -88,6 +163,7 @@ public:
         o_numItems.setDefault(1000).abbrev('I').description("Number of items to operate on");
         o_numPersists.setDefault(0).description("Number of persists_to for the stores");
         o_numReplicates.setDefault(0).description("Number of replicates_to for the stores");
+        o_numQueries.setDefault(0).abbrev('Q').description("Number of queries per second");
         o_keyPrefix.abbrev('p').description("key prefix to use");
         o_numThreads.setDefault(1).abbrev('t').description("The number of threads to use");
         o_randSeed.setDefault(0).abbrev('s').description("Specify random seed").hide();
@@ -127,6 +203,7 @@ public:
         parser.addOption(o_numItems);
         parser.addOption(o_numPersists);
         parser.addOption(o_numReplicates);
+        parser.addOption(o_numQueries);
         parser.addOption(o_keyPrefix);
         parser.addOption(o_numThreads);
         parser.addOption(o_randSeed);
@@ -207,6 +284,8 @@ public:
     uint32_t getNumPersists() { return o_numPersists; }
     uint32_t getNumReplicates() { return o_numReplicates; }
     uint32_t getRateLimit() { return o_rateLimit; }
+    uint32_t getNumQueries() {return o_numQueries;}
+    uint32_t getMaxSize() {return o_maxSize;}
 
     void *data;
 
@@ -226,6 +305,7 @@ private:
     UIntOption o_numItems;
     UIntOption o_numPersists;
     UIntOption o_numReplicates;
+    UIntOption o_numQueries;
     StringOption o_keyPrefix;
     UIntOption o_numThreads;
     UIntOption o_randSeed;
@@ -438,7 +518,12 @@ public:
                     lcb_CMDSTORE scmd = { 0 };
                     scmd.operation = LCB_SET;
                     LCB_CMD_SET_KEY(&scmd, opinfo.key.c_str(), opinfo.key.size());
-                    LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
+                    if (config.getNumQueries() > 0) {
+                        std::string s = create_view_data(config.getMaxSize());
+                        LCB_CMD_SET_VALUE(&scmd, s.c_str(), s.size());
+                    } else {
+                        LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
+                    }
                     error = lcb_store3(instance, this, &scmd);
                 } else {
                     /*lcb_RESPSTOREDUR resp = { 0 };
@@ -451,7 +536,12 @@ public:
                     scmd.persist_to = config.getNumPersists();
                     scmd.replicate_to = config.getNumReplicates();
                     LCB_CMD_SET_KEY(&scmd, opinfo.key.c_str(), opinfo.key.size());
-                    LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
+                    if (config.getNumQueries() > 0) {
+                        std::string s = create_view_data(config.getMaxSize());
+                        LCB_CMD_SET_VALUE(&scmd, s.c_str(), s.size());
+                    } else {
+                        LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
+                    }
                     error = lcb_storedur3(instance, this, &scmd);
                 }
 
